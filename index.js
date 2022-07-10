@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const jwt = require("jsonwebtoken");
 require("dotenv").config();
 const { MongoClient, ServerApiVersion } = require("mongodb");
 const app = express();
@@ -8,6 +9,24 @@ const port = process.env.PORT || 5000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// MiddleTire
+const verifyJWT = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader) {
+        return res.status(401).send({ message: "unauthorized" });
+    }
+    const token = authHeader.split(" ")[1];
+
+    jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, async (err, decoded) => {
+        if (err) {
+            return res.status(403).send({ message: "forbidden" });
+        }
+        req.decoded = decoded;
+        await next();
+    });
+};
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.bdn6hdg.mongodb.net/?retryWrites=true&w=majority`;
 const client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true, serverApi: ServerApiVersion.v1 });
@@ -28,18 +47,50 @@ const run = async () => {
             res.send(navItems);
         });
 
+        // get All users
+        app.get("/users", verifyJWT, async (req, res) => {
+            const users = await userCollection.find().toArray();
+            res.send(users);
+        });
+
+        // check admin role using api
+        app.get("/admin/:email", verifyJWT, async (req, res) => {
+            const email = req.params.email;
+            const decodedEmail = req.decoded.email;
+            const requesterAccount = await userCollection.findOne({ email: decodedEmail });
+            const isAdmin = requesterAccount.role === "admin";
+            res.send({ isAdmin });
+        });
+
+        // update user to admin
+        app.put("/user/admin/:email", verifyJWT, async (req, res) => {
+            const email = req.params.email;
+            const requester = req.decoded.email;
+            const requesterAccount = await userCollection.findOne({ email: requester });
+            if (requesterAccount.role === "admin") {
+                const filter = { email: email };
+                const updateDoc = {
+                    $set: { role: "admin" },
+                };
+                const result = await userCollection.updateOne(filter, updateDoc);
+                res.send(result);
+            } else {
+                res.status(403).send({ message: "forbidden" });
+            }
+        });
+
         // User Update or Insert by PUT
         app.put("/user/:email", async (req, res) => {
             const email = req.params.email;
             const user = req.body;
-            console.log(email, user);
             const filter = { email: email };
             const options = { upsert: true };
             const updateDoc = {
                 $set: user,
             };
             const result = await userCollection.updateOne(filter, updateDoc, options);
-            res.send(result);
+            const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, { expiresIn: "1h" });
+            res.send({ result, token });
         });
 
         app.get("/services", async (req, res) => {
@@ -87,11 +138,16 @@ const run = async () => {
          * app.delete(/booking/:id) // delete specific booking
          */
 
-        app.get("/booking", async (req, res) => {
+        app.get("/booking", verifyJWT, async (req, res) => {
             const email = req.query.email;
-            const query = { email: email };
-            const booking = await bookingCollection.find(query).toArray();
-            res.send(booking);
+            const decodedEmail = req.decoded.email;
+            if (decodedEmail === email) {
+                const query = { email: email };
+                const booking = await bookingCollection.find(query).toArray();
+                return res.send(booking);
+            } else {
+                return res.status(403).send({ message: "forbidden" });
+            }
         });
 
         app.post("/booking", async (req, res) => {
