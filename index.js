@@ -130,7 +130,7 @@ const run = async () => {
         });
 
         /**
-         * API Naming Convention
+         * API Naming Convention.
          * app.get('/booking) // get all bookings in the collection.
          * app.get(/booking/:id) // get specific booking item.
          * app.post(/booking) // add a new booking
