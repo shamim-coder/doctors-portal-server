@@ -2,7 +2,11 @@ const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const nodemailer = require("nodemailer");
+const sgTransport = require("nodemailer-sendgrid-transport");
+
 const app = express();
 const port = process.env.PORT || 5000;
 
@@ -28,6 +32,78 @@ const verifyJWT = async (req, res, next) => {
     });
 };
 
+// option to connect with SENDGRID
+const emailSenderOptions = {
+    auth: {
+        api_key: process.env.EMAIL_SENDER_KEY,
+    },
+};
+
+const emailClient = nodemailer.createTransport(sgTransport(emailSenderOptions));
+
+const sendAppointmentEmail = (booking) => {
+    const { email, patientName, date, slot, treatmentName, doctor } = booking;
+
+    const emailSender = {
+        from: process.env.EMAIL_SENDER,
+        to: email,
+        subject: `Your appointment for ${treatmentName} is Confirm`,
+        text: `Your appointment for ${treatmentName} is Confirm`,
+        html: `
+        <div>
+            <h1>Hello ${patientName}</h1>
+            <p>Congratulation! you have successfully booking your appointment for ${treatmentName} on ${date} at ${slot}</p>
+            <p>Your doctor ${doctor} looking forward to see you on ${date} </p>
+
+            <h4>Our Address:</h4>
+            <address> CB-10, Muslim Modern School Road, Kachukhet Puran Bazar, Dhaka Cantonment, Dhaka-1206 </address>
+
+
+        </div>`,
+    };
+
+    emailClient.sendMail(emailSender, function (err, info) {
+        if (err) {
+            console.log(err);
+        } else {
+            console.log("Message sent: " + info.response);
+        }
+    });
+};
+
+const sendPaymentEmail = (bookingInfo) => {
+    const { email, patientName, date, slot, treatmentName, amount, transactionId } = bookingInfo;
+
+    const emailSender = {
+        from: process.env.EMAIL_SENDER,
+        to: email,
+        subject: `Your Payment for ${treatmentName} has been received`,
+        text: `Your Payment for ${treatmentName} is Confirm`,
+        html: `
+        <div>
+            <h2>Hello ${patientName}</h2>
+            <p>Thank you for your payment, your appointment of ${treatmentName} on ${date} at ${slot} is confirmed by your payment.</p>
+            
+            <h4>You have paid $${amount}  for your appointment</h4>
+            <h4>Your Transaction ID: ${transactionId}</h4>
+            <br>
+            <br>
+            <h4>Our Address:</h4>
+            <address> CB-10, Muslim Modern School Road, Kachukhet Puran Bazar, Dhaka Cantonment, Dhaka-1206 </address>
+
+
+        </div>`,
+    };
+
+    emailClient.sendMail(emailSender, function (err, info) {
+        if (err) {
+            console.log(err);
+        } else {
+            console.log("Message sent: " + info.response);
+        }
+    });
+};
+
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.bdn6hdg.mongodb.net/?retryWrites=true&w=majority`;
 const client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true, serverApi: ServerApiVersion.v1 });
 
@@ -38,6 +114,7 @@ const run = async () => {
         const serviceCollection = client.db("doctors-portal").collection("services");
         const navCollection = client.db("doctors-portal").collection("navItems");
         const userCollection = client.db("doctors-portal").collection("users");
+        const paymentCollection = client.db("doctors-portal").collection("payments");
 
         // Nav Items API
         app.get("/navItems", async (req, res) => {
@@ -47,10 +124,22 @@ const run = async () => {
             res.send(navItems);
         });
 
-        // get All users
-        app.get("/users", verifyJWT, async (req, res) => {
-            const users = await userCollection.find().toArray();
-            res.send(users);
+        //
+        app.post("/create-payment-intent", verifyJWT, async (req, res) => {
+            const { price } = req.body;
+            const amount = parseInt(price) * 100;
+
+            const paymentIntent = await stripe.paymentIntents.create({
+                amount: amount,
+                currency: "usd",
+                payment_method_types: ["card"],
+                // automatic_payment_methods: {
+                //     enabled: true,
+                // },
+            });
+            res.send({
+                clientSecret: paymentIntent.client_secret,
+            });
         });
 
         // check admin role using api
@@ -60,6 +149,12 @@ const run = async () => {
             const requesterAccount = await userCollection.findOne({ email: decodedEmail });
             const isAdmin = requesterAccount.role === "admin";
             res.send({ isAdmin });
+        });
+
+        // get All users
+        app.get("/users", verifyJWT, async (req, res) => {
+            const users = await userCollection.find().toArray();
+            res.send(users);
         });
 
         // update user to admin
@@ -143,11 +238,18 @@ const run = async () => {
             const decodedEmail = req.decoded.email;
             if (decodedEmail === email) {
                 const query = { email: email };
-                const booking = await bookingCollection.find(query).toArray();
+                const booking = await bookingCollection.find(query).sort({ _id: -1 }).toArray();
                 return res.send(booking);
             } else {
                 return res.status(403).send({ message: "forbidden" });
             }
+        });
+
+        app.get("/booking/:id", async (req, res) => {
+            const { id } = req.params;
+            const query = { _id: ObjectId(id) };
+            const booking = await bookingCollection.findOne(query);
+            res.send(booking);
         });
 
         app.post("/booking", async (req, res) => {
@@ -159,8 +261,29 @@ const run = async () => {
                 return res.send({ success: false, existsData: exists });
             }
             const result = await bookingCollection.insertOne(booking);
+
+            // sending confirmation email....
+            sendAppointmentEmail(booking);
+
             return res.send({ success: true, result });
-        }); //
+        });
+
+        app.patch("/booking/:id", async (req, res) => {
+            const { id } = req.params;
+            const paymentInfo = req.body;
+            const filter = { _id: ObjectId(id) };
+            const updatedDoc = {
+                $set: {
+                    paid: true,
+                    transactionId: paymentInfo.transactionId,
+                },
+            };
+
+            const updateBooking = await bookingCollection.updateOne(filter, updatedDoc);
+            const updatePayment = await paymentCollection.insertOne(paymentInfo);
+            sendPaymentEmail(paymentInfo);
+            res.send({ updateBooking, updatePayment });
+        });
     } finally {
         // await client.close();
     }
